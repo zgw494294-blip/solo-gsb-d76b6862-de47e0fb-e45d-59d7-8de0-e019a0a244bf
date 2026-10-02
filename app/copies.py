@@ -40,6 +40,9 @@ label），初始**无人持有**。
 启动时只为**没有任何历史记录**的副本补一条当前 `revision` 的 `baseline`
 快照（不编造早期历史、不改原数据，重复启动不重复补记），历史随原卷跨
 重启保留。`list_revisions` / `get_revision` 只读回看，不改变当前状态。
+**回看的批注按该版保存的原排序（创建顺序）返回**，不重排为
+`(start,end,label,id)` 几何顺序（groups 仍按该版几何稳定计算）；创建 /
+读取 / 变更**当前副本**的响应继续按几何顺序返回批注。
 """
 
 from __future__ import annotations
@@ -343,10 +346,17 @@ class CopyState:
         self.status = "finalized"
         self.revision += 1
 
-    def snapshot(self) -> dict:
-        """返回同一提交状态下的文本、批注（含持有者）与连通组。"""
+    def snapshot(self, sort_annotations: bool = True) -> dict:
+        """返回同一提交状态下的文本、批注（含持有者）与连通组。
+
+        ``sort_annotations=True``（实时快照：创建 / 读取 / 变更当前副本）时
+        批注按 (start, end, label, id) 稳定排序；``False``（历史回看）时按
+        该版保存的原排序（创建顺序）返回，不重排为几何顺序。两种情况下
+        groups 均在该版几何上按稳定顺序计算，与批注列表的排列无关。
+        """
         anns = self._all_annotations()
         groups = connected_groups(anns)
+        listed = sorted(anns, key=_sort_key) if sort_annotations else anns
         return {
             "id": self.copy_id,
             "text": self.text,
@@ -355,7 +365,7 @@ class CopyState:
             "annotations": [
                 {"id": a["id"], "start": a["start"], "end": a["end"],
                  "label": a["label"], "holder": self.holders.get(a["id"])}
-                for a in sorted(anns, key=_sort_key)
+                for a in listed
             ],
             "groups": [
                 {"annotation_ids": ids,
@@ -645,8 +655,9 @@ class CopyStore:
     def get_revision(self, copy_id: str, revision: int) -> dict:
         """读取指定版本的完整快照（只读，不改变当前状态）。
 
-        未知副本抛 ``CopyNotFound``、副本没有该版本的记录抛
-        ``RevisionNotFound``（均对应 HTTP 404）。
+        批注按该版保存的**原排序**（创建顺序）返回，不重排为几何顺序；
+        groups 仍按该版几何稳定计算。未知副本抛 ``CopyNotFound``、副本没有
+        该版本的记录抛 ``RevisionNotFound``（均对应 HTTP 404）。
         """
         with self._lock:
             conn = self._connect()
@@ -674,7 +685,9 @@ class CopyStore:
                 for r in rows:
                     if r[5] is not None:
                         state.holders[r[0]] = r[5]
-                snap = state.snapshot()
+                # 回看按该版保存的原排序（创建顺序）返回批注，不按几何重排；
+                # 不重写任何历史数据，也不改变当前副本。
+                snap = state.snapshot(sort_annotations=False)
                 snap["op"] = op
                 snap["reviewer"] = reviewer
                 return snap
