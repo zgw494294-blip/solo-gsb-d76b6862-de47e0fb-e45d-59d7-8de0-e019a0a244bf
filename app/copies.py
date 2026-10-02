@@ -40,6 +40,9 @@ label），初始**无人持有**。
 启动时只为**没有任何历史记录**的副本补一条当前 `revision` 的 `baseline`
 快照（不编造早期历史、不改原数据，重复启动不重复补记），历史随原卷跨
 重启保留。`list_revisions` / `get_revision` 只读回看，不改变当前状态。
+`get_revision` 的批注按**该版保存的原序**（`pos`，即创建顺序）返回——
+已存历史与旧库 baseline 同样适用，且只改读取、不回写历史数据；当前副本
+的创建 / 读取 / 变更响应仍按 (start, end, label, id) 稳定排序。
 """
 
 from __future__ import annotations
@@ -343,8 +346,13 @@ class CopyState:
         self.status = "finalized"
         self.revision += 1
 
-    def snapshot(self) -> dict:
-        """返回同一提交状态下的文本、批注（含持有者）与连通组。"""
+    def snapshot(self, sort: bool = True) -> dict:
+        """返回同一提交状态下的文本、批注（含持有者）与连通组。
+
+        批注默认按 (start, end, label, id) 稳定排序（当前副本的创建 /
+        读取 / 变更响应）；``sort=False`` 时按创建时保存的原序输出
+        （历史回看专用）。连通组始终按稳定顺序计算，不受影响。
+        """
         anns = self._all_annotations()
         groups = connected_groups(anns)
         return {
@@ -355,7 +363,7 @@ class CopyState:
             "annotations": [
                 {"id": a["id"], "start": a["start"], "end": a["end"],
                  "label": a["label"], "holder": self.holders.get(a["id"])}
-                for a in sorted(anns, key=_sort_key)
+                for a in (sorted(anns, key=_sort_key) if sort else anns)
             ],
             "groups": [
                 {"annotation_ids": ids,
@@ -645,8 +653,11 @@ class CopyStore:
     def get_revision(self, copy_id: str, revision: int) -> dict:
         """读取指定版本的完整快照（只读，不改变当前状态）。
 
-        未知副本抛 ``CopyNotFound``、副本没有该版本的记录抛
-        ``RevisionNotFound``（均对应 HTTP 404）。
+        批注按该版保存的原序（``pos``，即创建顺序）返回——已存历史与旧库
+        baseline 同样适用，只改读取、不回写历史数据；文本、范围、label、
+        holder、status、revision、op、reviewer 均来自所查版本。未知副本抛
+        ``CopyNotFound``、副本没有该版本的记录抛 ``RevisionNotFound``
+        （均对应 HTTP 404）。
         """
         with self._lock:
             conn = self._connect()
@@ -674,7 +685,9 @@ class CopyStore:
                 for r in rows:
                     if r[5] is not None:
                         state.holders[r[0]] = r[5]
-                snap = state.snapshot()
+                # 回看按该版保存的原序返回批注（sort=False）；
+                # 当前副本响应仍按 (start, end, label, id) 排序
+                snap = state.snapshot(sort=False)
                 snap["op"] = op
                 snap["reviewer"] = reviewer
                 return snap

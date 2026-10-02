@@ -92,16 +92,18 @@ def test_each_mutation_records_full_snapshot(store):
 
 
 def test_snapshot_preserves_original_annotation_order(store):
-    # 批注原排序（创建顺序）须按版本保留，而不是按 start 排序
+    # 回看快照按该版保存的原序（创建顺序）返回批注，不重排为几何顺序
     cid = store.create(TEXT, [ann("z", 20, 25), ann("a", 0, 3),
                               ann("m", 10, 12)])["id"]
     rev1 = store.get_revision(cid, 1)
-    # 存储层快照按 (start, end, label, id) 稳定排序输出（与实时快照一致），
-    # 但分组 / 回看基于的原排序须在重放后保持一致——用修改后的回看验证：
+    assert [a["id"] for a in rev1["annotations"]] == ["z", "a", "m"]
+    # 当前副本的读取仍按 (start, end, label, id) 几何排序
+    assert [a["id"] for a in store.get(cid)["annotations"]] == ["a", "m", "z"]
+    # 修改改变几何后，回看仍按该版保存的原序返回，字段来自所查版本
     store.claim(cid, "z", "alice")
     store.modify(cid, "z", "alice", 20, 24, "Z2")
     rev3 = store.get_revision(cid, 3)
-    assert [a["id"] for a in rev3["annotations"]] == ["a", "m", "z"]
+    assert [a["id"] for a in rev3["annotations"]] == ["z", "a", "m"]
     z = [a for a in rev3["annotations"] if a["id"] == "z"][0]
     assert (z["start"], z["end"], z["label"], z["holder"]) == \
         (20, 24, "Z2", "alice")
@@ -427,3 +429,129 @@ def test_http_failed_and_idempotent_requests_leave_no_history(client):
         {"revision": 1, "op": "create", "reviewer": None},
         {"revision": 2, "op": "claim", "reviewer": "alice"}]
     assert client.get(f"/api/copies/{cid}").json()["revision"] == 2
+
+
+# ---------- HTTP 回归：回看按该版保存的原序返回批注 ----------
+
+# 创建顺序（z → a → m）与几何 (start,end,label,id) 顺序（a → m → z）不同
+SHUFFLED_ANNS = [ann("z", 20, 25, "丁"), ann("a", 0, 3, "甲"),
+                 ann("m", 10, 12, "丙")]
+
+
+def test_http_revision_returns_saved_creation_order(client):
+    r = client.post("/api/copies", json={"text": TEXT,
+                                         "annotations": SHUFFLED_ANNS})
+    assert r.status_code == 201
+    cid = r.json()["id"]
+    # 创建响应（当前副本）按 (start,end,label,id) 几何排序
+    assert [a["id"] for a in r.json()["annotations"]] == ["a", "m", "z"]
+
+    # 回看 revision=1：按该版保存的原序（创建顺序）返回，字段来自该版
+    rev1 = client.get(f"/api/copies/{cid}/revisions/1").json()
+    assert rev1["op"] == "create" and rev1["reviewer"] is None
+    assert [a["id"] for a in rev1["annotations"]] == ["z", "a", "m"]
+    assert [(a["start"], a["end"], a["label"], a["holder"])
+            for a in rev1["annotations"]] == \
+        [(20, 25, "丁", None), (0, 3, "甲", None), (10, 12, "丙", None)]
+
+    # 当前副本的读取仍按几何排序；回看只读，不改变当前状态
+    current = client.get(f"/api/copies/{cid}").json()
+    assert [a["id"] for a in current["annotations"]] == ["a", "m", "z"]
+    assert current["revision"] == 1
+
+
+def test_http_revision_keeps_saved_order_after_modify(client):
+    cid = _create(client, anns=SHUFFLED_ANNS)
+    client.post(f"/api/copies/{cid}/annotations/z/claim",
+                json={"reviewer": "alice"})
+    # 修改把 z 移到 a 与 m 之间的几何位置（不与任何批注重叠）
+    r = client.patch(f"/api/copies/{cid}/annotations/z",
+                     json={"reviewer": "alice", "start": 4, "end": 6,
+                           "label": "丁改"})
+    assert r.status_code == 200
+    # 变更当前副本的响应按新几何排序
+    assert [a["id"] for a in r.json()["annotations"]] == ["a", "z", "m"]
+
+    # 回看修改版本（revision=3）：仍按该版保存的原序，字段来自该版
+    rev3 = client.get(f"/api/copies/{cid}/revisions/3").json()
+    assert rev3["op"] == "modify" and rev3["reviewer"] == "alice"
+    assert [a["id"] for a in rev3["annotations"]] == ["z", "a", "m"]
+    z = rev3["annotations"][0]
+    assert (z["start"], z["end"], z["label"], z["holder"]) == \
+        (4, 6, "丁改", "alice")
+
+    # 回看创建版本：原范围、无人持有，顺序同为创建顺序
+    rev1 = client.get(f"/api/copies/{cid}/revisions/1").json()
+    assert [a["id"] for a in rev1["annotations"]] == ["z", "a", "m"]
+    assert (rev1["annotations"][0]["start"], rev1["annotations"][0]["end"],
+            rev1["annotations"][0]["label"]) == (20, 25, "丁")
+
+    # 只读：当前副本不受回看影响，仍按新几何排序
+    current = client.get(f"/api/copies/{cid}").json()
+    assert current["revision"] == 3
+    assert [a["id"] for a in current["annotations"]] == ["a", "z", "m"]
+
+
+def _make_shuffled_old_db(db):
+    """手工构造无历史表的旧库：批注 pos 顺序（z → a → m）与几何排序不同。"""
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE copies (
+            id TEXT PRIMARY KEY, text TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE annotations (
+            copy_id TEXT NOT NULL, ann_id TEXT NOT NULL, pos INTEGER NOT NULL,
+            start INTEGER NOT NULL, end INTEGER NOT NULL, label TEXT NOT NULL,
+            holder TEXT, PRIMARY KEY (copy_id, ann_id));
+    """)
+    conn.execute("INSERT INTO copies(id, text, revision) VALUES('c1', ?, 5)",
+                 (TEXT,))
+    conn.execute(
+        "INSERT INTO annotations VALUES('c1', 'z', 0, 20, 25, '丁', NULL)")
+    conn.execute(
+        "INSERT INTO annotations VALUES('c1', 'a', 1, 0, 3, '甲', 'alice')")
+    conn.execute(
+        "INSERT INTO annotations VALUES('c1', 'm', 2, 10, 12, '丙', NULL)")
+    conn.commit()
+    conn.close()
+
+
+def test_http_revision_baseline_keeps_old_db_order(tmp_path, monkeypatch):
+    # 旧库（无历史表）：启动时补记的 baseline 回看同样按保存的原序返回
+    db = tmp_path / "copies.db"
+    _make_shuffled_old_db(db)
+    monkeypatch.setenv("COPY_DB_PATH", str(db))
+    import app.main as main
+    importlib.reload(main)  # 用新环境变量重新初始化全局仓库
+    from fastapi.testclient import TestClient
+    with TestClient(main.app) as client:
+        body = client.get("/api/copies/c1/revisions").json()
+        assert body["revisions"] == [
+            {"revision": 5, "op": "baseline", "reviewer": None}]
+        base = client.get("/api/copies/c1/revisions/5").json()
+        assert base["op"] == "baseline" and base["reviewer"] is None
+        assert [a["id"] for a in base["annotations"]] == ["z", "a", "m"]
+        assert base["annotations"][1]["holder"] == "alice"  # 字段来自该版
+        # 当前副本读取仍按几何排序；不回写历史数据（重复启动不重复补记）
+        current = client.get("/api/copies/c1").json()
+        assert [a["id"] for a in current["annotations"]] == ["a", "m", "z"]
+    main._store = None
+
+
+def test_http_revision_order_survives_restart(client):
+    import app.main as main
+    cid = _create(client, anns=SHUFFLED_ANNS)
+    client.post(f"/api/copies/{cid}/annotations/z/claim",
+                json={"reviewer": "alice"})
+
+    # 模拟容器重启：丢弃内存中的仓库，下次请求在同一数据库文件上重建
+    main._store = None
+    rev1 = client.get(f"/api/copies/{cid}/revisions/1").json()
+    assert [a["id"] for a in rev1["annotations"]] == ["z", "a", "m"]
+    rev2 = client.get(f"/api/copies/{cid}/revisions/2").json()
+    assert rev2["op"] == "claim" and rev2["reviewer"] == "alice"
+    assert [a["id"] for a in rev2["annotations"]] == ["z", "a", "m"]
+    assert rev2["annotations"][0]["holder"] == "alice"
+    # 重启后当前副本读取仍按几何排序
+    current = client.get(f"/api/copies/{cid}").json()
+    assert [a["id"] for a in current["annotations"]] == ["a", "m", "z"]
